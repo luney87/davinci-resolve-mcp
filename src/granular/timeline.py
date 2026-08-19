@@ -1022,7 +1022,8 @@ def create_timeline_from_clips(
         clip_infos: Positioned form — list of dicts with keys clip_id (or
             media_pool_item_id), start_frame, end_frame, record_frame.
             record_frame is relative to the created timeline start frame by
-            default; pass record_frame_mode="absolute" for raw Resolve values.
+            default; set record_frame_mode="absolute" inside the entry for
+            raw Resolve values.
         If both are None, uses the currently selected media pool clips.
     """
     project, mp, err = _get_mp()

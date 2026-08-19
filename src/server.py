@@ -3011,6 +3011,16 @@ def _timeline_transcript(tl, *, with_timecodes=False):
     }
 
 
+_RECORD_FRAME_MODE_ALIASES = {
+    "relative": "relative",
+    "timeline_relative": "relative",
+    "offset": "relative",
+    "absolute": "absolute",
+    "timeline_absolute": "absolute",
+    "auto": "auto",
+}
+
+
 def _normalize_record_frame(
     ci: Dict[str, Any],
     index: int,
@@ -3023,15 +3033,7 @@ def _normalize_record_frame(
 
     mode_raw = ci.get("recordFrameMode", ci.get("record_frame_mode", "relative"))
     mode = str(mode_raw or "relative").strip().lower()
-    mode_aliases = {
-        "relative": "relative",
-        "timeline_relative": "relative",
-        "offset": "relative",
-        "absolute": "absolute",
-        "timeline_absolute": "absolute",
-        "auto": "auto",
-    }
-    mode = mode_aliases.get(mode)
+    mode = _RECORD_FRAME_MODE_ALIASES.get(mode)
     if not mode:
         return None, _err(
             f"clip_infos[{index}] record_frame_mode must be 'relative', 'absolute', or 'auto'"
@@ -3167,6 +3169,50 @@ def _build_create_clip_info_dict(
         "endFrame": ef,
         "recordFrame": rf,
     }, None
+
+
+_POSITIONED_CLIP_INFO_KEYS = frozenset({
+    "clip_id", "media_pool_item_id",
+    "start_frame", "startFrame",
+    "end_frame", "endFrame",
+    "record_frame", "recordFrame",
+    "record_frame_mode", "recordFrameMode",
+    "track_index", "trackIndex",
+    "media_type", "mediaType",
+})
+
+
+def _prepare_positioned_clip_infos(p: Dict[str, Any], raw: List[Any]):
+    """Validate user-supplied clip_infos entries before the append builders run.
+
+    Only dispatcher entry points call this — internal callers (multicam rows,
+    edit_engine swaps) carry extra bookkeeping keys and skip it. Two guarantees:
+
+    - Unknown entry keys are an error, not a silent drop. Resolve ignores
+      unknown clipInfo keys, so a misspelled record_frame_mode used to change
+      nothing and the clip landed at start_frame + record_frame (#154).
+    - A params-level record_frame_mode/recordFrameMode acts as the default for
+      every entry; an entry's own mode key still wins.
+    """
+    default_mode = p.get("record_frame_mode", p.get("recordFrameMode"))
+    if default_mode is not None:
+        if str(default_mode or "").strip().lower() not in _RECORD_FRAME_MODE_ALIASES:
+            return None, _err("record_frame_mode must be 'relative', 'absolute', or 'auto'")
+    entries = []
+    for i, ci in enumerate(raw):
+        if not isinstance(ci, dict):
+            return None, _err(f"clip_infos[{i}] must be an object")
+        unknown = sorted(set(ci) - _POSITIONED_CLIP_INFO_KEYS)
+        if unknown:
+            return None, _err(
+                f"clip_infos[{i}] has unknown key(s): {', '.join(unknown)}. "
+                f"Accepted keys: {', '.join(sorted(_POSITIONED_CLIP_INFO_KEYS))}"
+            )
+        entry = dict(ci)
+        if default_mode is not None and "record_frame_mode" not in entry and "recordFrameMode" not in entry:
+            entry["record_frame_mode"] = default_mode
+        entries.append(entry)
+    return entries, None
 
 
 def _frame_int(v):
@@ -20246,11 +20292,13 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
         — if_exists: version (default), reuse, or fail
       create_timeline_from_clips(name, clip_ids, if_exists?) -> {success, name, id}
         — simple: params.clip_ids appends clips end-to-end into a new timeline
-      create_timeline_from_clips(name, clip_infos, if_exists?) -> {success, name, id}
+      create_timeline_from_clips(name, clip_infos, if_exists?, record_frame_mode?) -> {success, name, id}
         — positioned: params.clip_infos is a list of {clip_id or media_pool_item_id,
-          start_frame & end_frame (or startFrame/endFrame), record_frame/recordFrame}.
+          start_frame & end_frame (or startFrame/endFrame), record_frame/recordFrame,
+          optional record_frame_mode}. Unknown keys in an entry are an error.
           record_frame is relative to the created timeline start frame by default;
-          pass record_frame_mode="absolute" for raw Resolve recordFrame values.
+          record_frame_mode="absolute" (inside an entry, or at the params top level
+          as the default for all entries) uses raw Resolve recordFrame values.
       setup_multicam_timeline(name, clip_ids|angles, sync_mode?, include_audio?, dry_run?) -> {success}
         — creates a stacked multicam prep timeline: one angle per video track, optional
           matching audio tracks. Native multicam clip conversion remains a Resolve UI step.
@@ -20260,12 +20308,14 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
         CATASTROPHIC. Deletes timelines outright.
       append_to_timeline(clip_ids) -> {success, count}
         — legacy: params.clip_ids only (appends at end / default placement)
-      append_to_timeline(clip_infos) -> {success, count, items}
+      append_to_timeline(clip_infos, record_frame_mode?) -> {success, count, items}
         — positioned: params.clip_infos is a list of {clip_id or media_pool_item_id,
           start_frame & end_frame (or startFrame/endFrame), record_frame/recordFrame,
-          track_index/trackIndex (1-based), optional media_type/mediaType (1=video, 2=audio)}.
+          track_index/trackIndex (1-based), optional media_type/mediaType (1=video, 2=audio),
+          optional record_frame_mode}. Unknown keys in an entry are an error.
           record_frame is relative to the current timeline start frame by default;
-          pass record_frame_mode="absolute" for raw Resolve recordFrame values.
+          record_frame_mode="absolute" (inside an entry, or at the params top level
+          as the default for all entries) uses raw Resolve recordFrame values.
           Returns timeline_item_id per item.
       import_media(paths) -> {imported}
         UNSAFE. No dry_run. Prefer safe_import_media.
@@ -20399,6 +20449,9 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
                 return _err("clip_infos must be a list")
             if not raw:
                 return _err("clip_infos must be a non-empty list")
+            raw, prep_err = _prepare_positioned_clip_infos(p, raw)
+            if prep_err:
+                return prep_err
             for i, ci in enumerate(raw):
                 _, row_err = _build_create_clip_info_dict(root, ci, i)
                 if row_err:
@@ -20502,6 +20555,9 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
                 return _err("clip_infos must be a list")
             if not raw:
                 return _err("clip_infos must be a non-empty list")
+            raw, prep_err = _prepare_positioned_clip_infos(p, raw)
+            if prep_err:
+                return prep_err
             timeline_start = _timeline_start_frame(proj.GetCurrentTimeline())
             built = []
             for i, ci in enumerate(raw):
