@@ -55,7 +55,28 @@ _Not yet captured._
 
 <!-- How a piece starts, what the first frames have to do, how it lands. -->
 
-_Not yet captured._
+- **A cold-open teaser must tell the viewer what the episode is about, not
+  collect "best moments."** Every bite must be a self-contained, concrete
+  statement (a list, a number, a piece of advice), and the bites in sequence
+  must read as one coherent mini-argument: topic → thesis → payoff. No
+  mid-sentence fragments whose context lives elsewhere in the episode.
+  **Why:** the editor rejected two intros built as highlight reels ("intro
+  jak zwykle kompletnie bez sensu — słuchacz nie będzie miał pojęcia o czym
+  mowa"). The approved WYWIAD 2 intro is the reference: "Make sure you know
+  your competition." → channel list → challenges → "first paying customer
+  within a year." **The trap:** a line that is impressive *inside* its answer
+  ("Honestly, I spent 10 years in hospitality") is noise *outside* it — test
+  each bite by asking what a first-time viewer learns about the episode from
+  it alone.
+- **An answer-bite needs its question (or an equivalent setup) in front of
+  it.** Even a concrete list ("commercial real estate, mining, wholesalers…")
+  reads as noise when the viewer doesn't know what prompted it — open the
+  teaser with the interviewer's question or a framing line, then the answer.
+  **Why:** second correction on the same intro: "początek jest zawieszony bez
+  kontekstu — wymienia branże, ale dlaczego? Coś przed to wymienianie trzeba
+  dać." **The trap:** the editor also said a teaser may run a few seconds
+  over the nominal length ("może być intro trochę dłuższe niż 30 sekund") —
+  don't sacrifice the setup line to hit a round number.
 
 ## Rejected by default
 
