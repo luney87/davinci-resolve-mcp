@@ -471,6 +471,73 @@ class OperationSurfaceTests(unittest.TestCase):
         self.assertEqual(len(listing["timelines"]), 5)
         self.assertTrue(listing["truncated"])
 
+    # -- a proxied return that does not fit must SAY so ---------------------
+    #
+    # Regression: `_encode` used to shorten any list past max_items with nothing
+    # anywhere recording it, and a short list cannot be told apart from a
+    # genuinely short result. An 864-clipInfo AppendToTimeline came back as 500
+    # items, and the silence-ripple readback counted them — reporting a variant
+    # of 432 video + 432 audio as 250 + 250, which reads as dropped material.
+
+    def _counting_ops(self, produced: int):
+        class Producer:
+            def Enumerate(self_inner):
+                return [_FakeTimeline(f"T{i}") for i in range(produced)]
+
+            def GetProjectManager(self_inner):
+                return self_inner
+
+            def GetCurrentProject(self_inner):
+                return self_inner
+
+            def GetMediaPool(self_inner):
+                return self_inner
+
+        return self._ops(resolve=Producer())
+
+    def test_a_truncated_proxy_reply_reports_what_it_dropped(self) -> None:
+        ops = self._counting_ops(864)
+        ops.max_items = 500
+        reply = ops.dispatch("call", {"target": "media_pool", "method": "Enumerate"})
+        self.assertEqual(len(reply["value"]), 500)
+        truncated = reply["truncated"]
+        self.assertEqual(truncated["dropped"], 364)
+        self.assertEqual(truncated["limit"], 500)
+        self.assertEqual(truncated["containers"][0]["total"], 864)
+
+    def test_a_reply_that_fits_carries_no_truncation_key(self) -> None:
+        ops = self._counting_ops(864)
+        reply = ops.dispatch("call", {"target": "media_pool", "method": "Enumerate"})
+        self.assertEqual(len(reply["value"]), 864)
+        self.assertNotIn("truncated", reply)
+
+    def test_truncation_state_does_not_leak_between_calls(self) -> None:
+        ops = self._counting_ops(864)
+        ops.max_items = 500
+        ops.dispatch("call", {"target": "media_pool", "method": "Enumerate"})
+        ops.max_items = 2000
+        self.assertNotIn(
+            "truncated",
+            ops.dispatch("call", {"target": "media_pool", "method": "Enumerate"}),
+        )
+
+    def test_the_ceiling_never_exceeds_the_handle_table(self) -> None:
+        # A list longer than MAX_HANDLES evicts its own earliest entries while
+        # it is still being minted, so the client receives handles that are
+        # already stale. A short list beats a poisoned one.
+        from src.utils import resolve_bridge_ops as rbo
+        ops = rbo.ResolveOperations(
+            FakeResolve(), media_roots=[self.ROOT], output_roots=[self.ROOT],
+            max_items=1_000_000,
+        )
+        self.assertLessEqual(ops.max_items, rbo.ResolveOperations.MAX_HANDLES)
+
+    def test_the_default_ceiling_clears_a_timeline_scale_return(self) -> None:
+        # The reported failure sent 864 clipInfos in one append. A default that
+        # cannot carry that is the bug, not a tuning preference.
+        from src.utils import resolve_bridge_ops as rbo
+        self.assertGreater(rbo.ResolveOperations.DEFAULT_MAX_ITEMS, 864)
+
     def test_path_policy_rejects_traversal_and_relative_paths(self) -> None:
         from src.utils import resolve_bridge_ops as ops
         policy = ops.PathPolicy([self.ROOT], [self.ROOT])
@@ -2880,3 +2947,92 @@ class BoundMethodKeywordTests(unittest.TestCase):
             "the free-edition bridge's _BoundMethod (PR #165). Rewrite these "
             "positionally:\n  " + "\n  ".join(offenders),
         )
+
+
+class InstallerGuidanceTests(unittest.TestCase):
+    """What the installer tells the user after it writes the files.
+
+    Issue #219: a user saw two identical `resolve_bridge_canary` entries and no
+    `resolve_bridge_probe`, followed the printed steps to a menu entry that
+    cannot exist, ran the canary, and saw nothing happen. Every part of that
+    was already understood by this code — the duplicate is one canary per
+    Scripts folder, the missing probe is exactly what the canary exists to
+    signal, and the canary reports through `print()` to Workspace > Console.
+    None of it was ever said out loud. These tests pin that it is.
+    """
+
+    @staticmethod
+    def _installer():
+        import importlib.util
+        from pathlib import Path as _Path
+        path = _Path(__file__).resolve().parents[1] / "scripts" / "install_resolve_bridge.py"
+        spec = importlib.util.spec_from_file_location("_install_resolve_bridge", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _result(canaries: int):
+        installed = [f"/target{i}/Scripts/Utility/resolve_bridge_canary.lua"
+                     for i in range(canaries)]
+        installed.append("/target0/Scripts/Utility/resolve_bridge_probe.py")
+        return {"installed": installed}
+
+    def test_the_canary_filename_has_one_definition(self) -> None:
+        """The writer and the counter must not be able to disagree — a guidance
+        line promising entries that are not there is worse than no line."""
+        installer = self._installer()
+        self.assertEqual(installer._CANARY_NAME, "resolve_bridge_canary.lua")
+        source = installer.__file__
+        with open(source, encoding="utf-8") as handle:
+            body = handle.read()
+        self.assertEqual(
+            body.count('"resolve_bridge_canary.lua"'), 1,
+            "the canary filename is written and counted; it gets one definition",
+        )
+
+    def test_duplicate_canaries_are_counted_and_explained(self) -> None:
+        installer = self._installer()
+        self.assertEqual(installer.canary_count(self._result(2)), 2)
+        text = "\n".join(installer.next_steps(self._result(2)))
+        self.assertIn("Expect 2 identical", text)
+        self.assertIn("not a double install", text)
+
+    def test_a_single_canary_gets_no_duplicate_warning(self) -> None:
+        """One entry needs no explanation; saying it anyway is noise that
+        trains people to skip the block that matters."""
+        installer = self._installer()
+        text = "\n".join(installer.next_steps(self._result(1)))
+        self.assertNotIn("identical", text)
+
+    def test_the_canary_only_case_has_guidance_at_all(self) -> None:
+        """The outcome the user actually hit. Step 3 names a menu entry that
+        does not exist in this case, so the block must say the install is fine
+        and stop them re-running it."""
+        installer = self._installer()
+        text = "\n".join(installer.next_steps(self._result(2)))
+        self.assertIn("no 'resolve_bridge_probe'", text)
+        self.assertIn("The install worked. Do not re-run it.", text)
+
+    def test_the_console_is_named_because_the_canary_prints_there(self) -> None:
+        """`print()` from a Lua script lands in Workspace > Console. Without
+        that pointer the canary looks broken, which is what was reported."""
+        installer = self._installer()
+        text = "\n".join(installer.next_steps(self._result(2)))
+        self.assertIn("Workspace > Console", text)
+        self.assertIn("looks", text)
+
+    def test_the_cause_is_split_by_edition_not_asserted_as_python_discovery(self) -> None:
+        """The canary's own text predates Resolve 21.1 and blames Python
+        discovery. On free 21.1 that is wrong — Python scripting moved to
+        Studio (#203) — and would send a user chasing PYTHON3HOME for a cause
+        that cannot apply. The guidance must carry both branches.
+        """
+        installer = self._installer()
+        text = "\n".join(installer.next_steps(self._result(2)))
+        self.assertIn("21.1+ FREE", text)
+        self.assertIn("#203", text)
+        self.assertIn("PYTHON3HOME", text)
+        free = text.index("21.1+ FREE")
+        studio = text.index("Studio, or 21.0.x")
+        self.assertLess(free, studio, "the newer, likelier cause reads first")
