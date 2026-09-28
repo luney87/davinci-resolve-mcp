@@ -2,6 +2,60 @@
 
 Release history for the DaVinci Resolve MCP Server. The latest release is summarized in the root README; older entries live here to keep the README focused.
 
+## What's New in v4.8.22 — the control panel port check cannot hang on a wedged lsof
+
+### Fixed
+
+- **`open_control_panel` could block forever behind an unkillable `lsof`.** The
+  port-owner check ran `lsof -iTCP:<port> -sTCP:LISTEN -t` through
+  `subprocess.run(timeout=3)`. On macOS, lsof wedges in uninterruptible kernel wait
+  (state `U` in `ps`) when a network mount is stale, and a process in that state
+  ignores SIGKILL. `subprocess.run`'s timeout path kills the child and then waits
+  for it, so the 3-second timeout never returned: the caller hung with the child.
+  Measured on 2026-09-26 on the release machine, where 489 lsof processes had been
+  stuck for 12 hours and the offline suite sat in this function for 13 minutes.
+  `_port_owner_pid` now starts lsof in its own session, polls to the deadline, and
+  on expiry sends SIGKILL and abandons the child instead of joining it. stdout is
+  read only once `poll()` reports an exit, and the pipe is closed on every path.
+  A missing lsof is still `None`, not an exception.
+
+### Tests
+
+- `tests/test_port_owner_pid.py`: a fake child whose `poll()` never returns and
+  whose `kill()` is a no-op yields `None` within the deadline with `wait()` and
+  `communicate()` never called and the pipe closed; an exited child still yields
+  its PID; a missing binary yields `None`; and a real subprocess that ignores
+  SIGTERM, with `kill` patched out, is left running rather than joined.
+
+## What's New in v4.8.21 — timeline duration no longer overcounts by one frame
+
+### Fixed
+
+- **Two timeline-duration readers reported one frame too many.** ([#269](https://github.com/samuelgursky/davinci-resolve-mcp/pull/269), @Dev-next-gen)
+  The granular `get_current_timeline` and `get_project_info`'s per-timeline
+  `duration` computed `GetEndFrame() - GetStartFrame() + 1`, while the compound
+  server, `brain_edits` and `render_stress` all use `GetEndFrame() - GetStartFrame()`
+  for the same timeline. `GetEndFrame()` is one past the last frame, so the `+ 1`
+  counted a frame that does not exist: a 600-frame timeline read back as 601. Both
+  readers now agree with the rest of the server.
+
+### Documentation
+
+- **`api_truth` records `Timeline.GetEndFrame` as an exclusive bound.** Measured
+  live on Studio 19.1.3.7 while reviewing #269: a timeline whose only full-length
+  item is a 32742-frame clip reads start 0 / end 32742, and the item's
+  `GetEnd()` is also 32742. The entry sits beside the existing
+  `AppendToTimeline clipInfo endFrame` entry, which documents the same half-open
+  convention on the write side, so the frame-count rule is now findable from
+  either direction.
+
+### Tests
+
+- `tests/test_timeline_duration.py` (from the PR): both readers return
+  `end - start` for a stubbed 86400..87000 timeline; fails on v4.8.20 with 601.
+- `tests/test_api_truth.py`: the new ledger entry is findable by `GetEndFrame`,
+  carries the `off-by-one` tag, and states the `end - start` rule.
+
 ## What's New in v4.8.20 — every boolean param honours `"false"`
 
 ### Fixed
