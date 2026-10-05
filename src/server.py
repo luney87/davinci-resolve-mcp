@@ -11,7 +11,7 @@ Usage:
     python src/server.py --full       # Start the 377-tool granular server instead
 """
 
-VERSION = "4.8.22"
+VERSION = "4.8.28"
 
 import base64
 import os
@@ -67,6 +67,8 @@ from src.utils.page_lock import (
     color_page_for_thumbnails as _color_page_for_thumbnails,
     edit_page_for_timeline_edits as _edit_page_for_timeline_edits,
     open_page_serialized as _open_page_serialized,
+    restore_page as _restore_page,
+    restoring_page as _restoring_page,
     page_lock as _page_lock,
 )
 from src.utils.proc import safe_run
@@ -1419,7 +1421,13 @@ def _resolve_safe_dir(path):
         # silently fails into both (live-verified 2026-07-03), same as /var/folders.
         _is_sandbox = path.startswith(("/var/", "/private/var/", "/tmp/", "/private/tmp/")) or path in ("/tmp", "/private/tmp")
     elif platform.system() == "Linux":
-        _is_sandbox = path.startswith("/tmp") or path.startswith("/var/tmp")
+        # By segment, not by character prefix: `startswith("/tmp")` also matched a
+        # sibling of /tmp whose name merely begins with it — /tmpfiles,
+        # /tmp-scratch, /var/tmpdata — so an export the caller aimed at one of
+        # those was redirected away from it. The Darwin branch already compares
+        # this way, and `/tmpfiles/out` is one of the paths
+        # tests/test_granular_safe_dir.py asserts is left alone.
+        _is_sandbox = path.startswith(("/tmp/", "/var/tmp/")) or path in ("/tmp", "/var/tmp")
     elif platform.system() == "Windows":
         # Check if path is under the system temp directory (e.g. AppData\Local\Temp)
         try:
@@ -1911,7 +1919,8 @@ def _activate_resolve_window() -> Dict[str, Any]:
             proc = subprocess.run(
                 ["osascript", "-e", 'tell application "DaVinci Resolve" to activate'],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5, stdin=subprocess.DEVNULL,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
             )
             return {
                 "activated": proc.returncode == 0,
@@ -1925,7 +1934,8 @@ def _activate_resolve_window() -> Dict[str, Any]:
                  "$s = New-Object -ComObject WScript.Shell; "
                  "$null = $s.AppActivate('DaVinci Resolve')"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5, stdin=subprocess.DEVNULL,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
             )
             return {
                 "activated": proc.returncode == 0,
@@ -1938,7 +1948,8 @@ def _activate_resolve_window() -> Dict[str, Any]:
             proc = subprocess.run(
                 ["wmctrl", "-a", "DaVinci Resolve"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5, stdin=subprocess.DEVNULL,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
             )
             return {
                 "activated": proc.returncode == 0,
@@ -1949,7 +1960,8 @@ def _activate_resolve_window() -> Dict[str, Any]:
             proc = subprocess.run(
                 ["xdotool", "search", "--name", "DaVinci Resolve", "windowactivate"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5, stdin=subprocess.DEVNULL,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
             )
             return {
                 "activated": proc.returncode == 0,
@@ -1981,7 +1993,8 @@ def _send_resolve_keystroke_go_to_mark_in() -> Dict[str, Any]:
             proc = subprocess.run(
                 ["osascript", "-e", script],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5, stdin=subprocess.DEVNULL,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
             )
             return {
                 "sent": proc.returncode == 0,
@@ -1997,7 +2010,8 @@ def _send_resolve_keystroke_go_to_mark_in() -> Dict[str, Any]:
                  "Start-Sleep -Milliseconds 150; "
                  "[System.Windows.Forms.SendKeys]::SendWait('+i')"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5, stdin=subprocess.DEVNULL,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
             )
             return {
                 "sent": proc.returncode == 0,
@@ -2011,7 +2025,8 @@ def _send_resolve_keystroke_go_to_mark_in() -> Dict[str, Any]:
             proc = subprocess.run(
                 ["xdotool", "search", "--name", "DaVinci Resolve", "key", "--window", "%@", "shift+i"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5, stdin=subprocess.DEVNULL,
+                timeout=5,
+                stdin=subprocess.DEVNULL,
             )
             return {"sent": proc.returncode == 0, "platform": "linux", "tool": "xdotool", "shortcut": "Shift+I"}
         return {"sent": False, "platform": sys.platform, "note": "no key-send tool found"}
@@ -13925,7 +13940,8 @@ def _ffprobe_media_summary(path: str) -> Optional[Dict[str, Any]]:
              "format=duration,size:stream=codec_type,codec_name",
              "-of", "json", path],
             capture_output=True, encoding="utf-8", errors="replace",
-            timeout=20, stdin=subprocess.DEVNULL,
+            timeout=20,
+            stdin=subprocess.DEVNULL,
         )
     except Exception:
         return None
@@ -14886,7 +14902,7 @@ def _ffmpeg_scale_to_bytes(src_path: str, max_width: Optional[int], out_format: 
             # -2 keeps the height even (required by some encoders) and preserves AR.
             args += ["-vf", f"scale='min({int(max_width)},iw)':-2:flags=lanczos"]
         args += ["-frames:v", "1", tmp_out]
-        proc = subprocess.run(args, capture_output=True, timeout=120)
+        proc = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
         if proc.returncode != 0:
             return None, (proc.stderr.decode("utf-8", "replace").strip() or "ffmpeg failed")[:400]
         with open(tmp_out, "rb") as handle:
@@ -15021,7 +15037,49 @@ def _render_job_completed(status: Optional[Dict[str, Any]]) -> bool:
         return False
 
 
-def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
+def _render_target_dir(proj, teardown: List[str]) -> Optional[str]:
+    """The project's current render TargetDir, read off a throwaway render job.
+
+    There is no GetRenderSettings, but a queued job carries the settings it
+    inherited: queue one, read TargetDir off its GetRenderJobList entry, delete
+    it. Measured on Studio 19.1.3.7 (api_truth 'Project.AddRenderJob (the only
+    readback for render settings)'): about 150 ms, no dialog even when an
+    identical job is already queued or the output file already exists.
+
+    Returns None when no job can be queued. That is what a project with no
+    render target does (AddRenderJob returns ''), and then there is nothing to
+    put back. A job that was queued and could not be removed again is reported
+    through `teardown`: it is the one thing this read can leave behind.
+    """
+    try:
+        job = proj.AddRenderJob()
+    except Exception:
+        return None
+    if not job:
+        return None
+    target = None
+    try:
+        for entry in proj.GetRenderJobList() or []:
+            if isinstance(entry, dict) and entry.get("JobId") == job:
+                target = entry.get("TargetDir")
+                break
+    except Exception:
+        target = None
+    try:
+        removed = bool(proj.DeleteRenderJob(job))
+    except Exception:
+        removed = False
+    if not removed:
+        logger.warning("frame capture could not remove its throwaway render job %s", job)
+        teardown.append(
+            f"A render job ({job}) queued only to read the output folder could not be "
+            "removed from the render queue. Delete it with render(action='delete_job')."
+        )
+    return target if isinstance(target, str) and target else None
+
+
+def _playhead_frame_render(proj, tl, p: Dict[str, Any],
+                           teardown: Optional[List[str]] = None):
     """Render exactly one frame — the only frame-accurate capture route.
 
     The two cheaper routes cannot do this job (both measured on Studio 19.1.3.7,
@@ -15034,18 +15092,33 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
     runs in well under a second, and needs no GUI panel or foreground window.
 
     The cost is that render settings are project-level state, and there is still
-    no GetRenderSettings to read them back from (absent as of 21.1). Three
-    different things happen on the way out:
+    no GetRenderSettings to read them back from (absent as of 21.1). Each one
+    the capture touches is put back by whatever route exists:
       - Format and codec are readable via GetCurrentRenderFormatAndCodec and are
         genuinely restored.
       - The mark range is readable via Timeline.GetMarkInOut, so a range the
         caller had set is put back (offset into SetRenderSettings' absolute
         frame space); with no range set it falls back to the whole timeline.
-      - TargetDir and CustomName are readable from nowhere, so they are reset to
-        sane values rather than restored.
+      - TargetDir is read off a throwaway render job before the capture changes
+        it (_render_target_dir) and written back afterwards. A project that
+        has never had a render target has nothing to read, and Resolve cannot
+        clear one once set, so there it is left on the capture's folder.
+      - CustomName is never written. It can be neither read nor cleared (an
+        empty one is refused on 19.1.3.7), so the capture renders under
+        whatever name the project already produces, into a folder of its own,
+        and takes the one file that appears there.
     Callers who need a strictly side-effect-free read should use
     quality="thumbnail" and accept per-clip granularity.
+
+    `teardown` collects one sentence per restore that did not take (render
+    mode, format/codec, render range, output folder, playhead, page). The
+    restores run in a `finally`, which cannot change the value already being
+    returned, so the caller passes the list in and attaches it to the result
+    afterwards (issue #270: the user was left on Deliver with nothing in the
+    result to say so).
     """
+    if teardown is None:
+        teardown = []
     fmt = str(p.get("format", "jpg")).lower().lstrip(".")
     if fmt == "jpeg":
         fmt = "jpg"
@@ -15084,30 +15157,21 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
     except (TypeError, ValueError):
         return _err("frame must be an integer", code="INVALID_FRAME", category="invalid_input")
 
-    folder = _resolve_safe_dir(os.path.join(tempfile.gettempdir(), "resolve-frame-captures"))
+    # A directory of this capture's own, inside the shared capture folder. The
+    # render is NOT given a CustomName (see the docstring), so the file comes
+    # out under the project's own naming and cannot be picked out of a shared
+    # folder by prefix; whatever appears in here is the frame.
+    base = _resolve_safe_dir(os.path.join(tempfile.gettempdir(), "resolve-frame-captures"))
+    folder = os.path.join(base, f"{STILL_STAGING_PREFIX}{_uuid.uuid4().hex}")
     os.makedirs(folder, exist_ok=True)
-    name = f"capture-{int(time.time() * 1000)}"
 
-    original_fc = None
-    try:
-        original_fc = proj.GetCurrentRenderFormatAndCodec()
-    except Exception:
-        pass
-    # Render MODE is project state too, and it decides whether the capture can
-    # work at all. In "Individual clips" mode (0) Resolve ignores CustomName,
-    # renders the WHOLE clip under the frame's own file naming, and the
-    # single-frame file this helper waits for never appears — measured
-    # 2026-09-09 on a project whose delivery preset was per-clip: every capture
-    # reported success, wrote no file, and took 30+ s rendering the clip.
-    # Force single clip (1) for the capture and put the mode back afterwards.
-    original_mode = None
-    try:
-        original_mode = proj.GetCurrentRenderMode()
-    except Exception:
-        original_mode = None
-    # Rendering pulls Resolve onto the Deliver page and moves the playhead;
-    # measured leaving the user on Deliver at a different frame. Both are ours
-    # to put back.
+    # Where the user is comes FIRST, before any render call. Issue #270: this
+    # was read after GetCurrentRenderMode(), and that getter itself switches
+    # Resolve to the Deliver page (measured on Studio 19.1.3.7 from Edit, Color
+    # and Fairlight; api_truth 'Project.GetCurrentRenderMode'). So the page
+    # recorded here was always 'deliver', the restore below was skipped as
+    # "nothing to restore", and every capture left the user on Deliver.
+    # Rendering can move the playhead as well. Both are ours to put back.
     resolve = get_resolve()
     original_page = None
     try:
@@ -15119,6 +15183,23 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
         original_tc = tl.GetCurrentTimecode()
     except Exception:
         pass
+    original_fc = None
+    try:
+        original_fc = proj.GetCurrentRenderFormatAndCodec()
+    except Exception:
+        pass
+    # Render MODE is project state too, and it decides whether the capture can
+    # work at all. In "Individual clips" mode (0) Resolve renders the WHOLE
+    # clip under its own per-clip file naming, and the single-frame file this
+    # helper waits for never appears — measured
+    # 2026-09-09 on a project whose delivery preset was per-clip: every capture
+    # reported success, wrote no file, and took 30+ s rendering the clip.
+    # Force single clip (1) for the capture and put the mode back afterwards.
+    original_mode = None
+    try:
+        original_mode = proj.GetCurrentRenderMode()
+    except Exception:
+        original_mode = None
     # The capture pins the render range to the captured frame, and there is no
     # GetRenderSettings to read the surrounding settings back from (still absent
     # in 21.1). The mark range is the exception: Timeline.GetMarkInOut reports it
@@ -15155,6 +15236,8 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
             original_marks = None
 
     job = None
+    range_pinned = False
+    original_target = None
     try:
         if original_mode is not None and original_mode != 1:
             if not proj.SetCurrentRenderMode(1):
@@ -15166,6 +15249,11 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
                     remediation="render(action='set_mode', params={'mode': 1}) then retry.",
                     state={"render_mode": original_mode},
                 )
+        # Read the output folder while the settings are still the user's, and
+        # in single-clip mode: in individual-clips mode a job may not queue at
+        # all (generator-only timeline, 19.1.3.7), and then there is no entry
+        # to read it from.
+        original_target = _render_target_dir(proj, teardown)
         codecs = proj.GetRenderCodecs("JPEG" if fmt == "jpg" else fmt.upper()) or {}
         codec = list(codecs.values())[0] if codecs else fmt
         if not proj.SetCurrentRenderFormatAndCodec(fmt, codec):
@@ -15176,7 +15264,6 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
             )
         applied = proj.SetRenderSettings({
             "TargetDir": folder,
-            "CustomName": name,
             "MarkIn": frame,
             "MarkOut": frame,
             "SelectAllFrames": False,
@@ -15189,17 +15276,16 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
                 code="RENDER_SETTINGS_REFUSED", category="api_error",
                 state={"frame": frame},
             )
+        range_pinned = True
         job = proj.AddRenderJob()
         if not job:
             return _err("AddRenderJob returned nothing", code="RENDER_JOB_FAILED", category="api_error")
-        # The folder is shared (every sandbox path redirects to one
-        # ~/Documents/resolve-stills) and the cleanup below removes it when it
-        # empties, so another capture — or anything else — can take it away
-        # between the makedirs above and here. Measured 2026-09-09: frame 81 of a
-        # 214-frame QC batch died in os.listdir on the missing folder. Recreate,
-        # don't assume.
+        # The parent is shared (every sandbox path redirects to one
+        # ~/Documents/resolve-stills) and each capture's cleanup removes it
+        # when it empties. Measured 2026-09-09, when captures still shared the
+        # folder itself: frame 81 of a 214-frame QC batch died in os.listdir on
+        # a folder another capture had just removed. Recreate, don't assume.
         os.makedirs(folder, exist_ok=True)
-        before = set(os.listdir(folder))
         # Positional on purpose: the free-edition bridge proxies method calls
         # positionally, and a keyword argument dies inside _BoundMethod with
         # "unexpected keyword argument 'isInteractiveMode'" before reaching
@@ -15222,15 +15308,19 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
                 code="RENDER_FAILED", category="api_error",
                 state={"status": status, "frame": frame},
             )
-        # Resolve appends the frame number to CustomName, so match on the prefix.
-        written = sorted(f for f in set(os.listdir(folder)) - before if f.startswith(name))
+        # The folder is this capture's alone, so whatever is in it is the
+        # frame — named by the project (custom name or timeline name, plus the
+        # frame number), which is not ours to predict.
+        written = sorted(
+            os.path.join(root, f) for root, _dirs, files in os.walk(folder) for f in files
+        )
         if not written:
             return _err(
                 "Render reported success but wrote no file",
                 code="RENDER_FAILED", category="api_error",
                 state={"folder": folder, "frame": frame},
             )
-        src_path = os.path.join(folder, written[0])
+        src_path = written[0]
         out_format = "jpg" if fmt == "jpg" else "png"
         if max_width or fmt == "tif":
             data, ff_err = _ffmpeg_scale_to_bytes(src_path, int(max_width) if max_width else None, out_format)
@@ -15259,6 +15349,10 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
                     "frame capture could not restore render mode %r: %s",
                     original_mode, mode_exc or "SetCurrentRenderMode returned False",
                 )
+                teardown.append(
+                    f"The render mode was left on single clip (1); restoring {original_mode!r} "
+                    "failed. Put it back with render(action='set_mode')."
+                )
         if original_fc:
             # A failed restore leaves the Deliver page on the capture's format
             # and codec, which the user's next render would silently inherit.
@@ -15276,13 +15370,24 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
                     original_fc.get("format"), original_fc.get("codec"),
                     restore_exc or "SetCurrentRenderFormatAndCodec returned False",
                 )
-        # Still not a full restore — GetRenderSettings does not exist, so the
-        # other settings cannot be read back. The mark range can: put the user's
-        # own range back when they had one, and fall back to the whole timeline
-        # when they did not, so the range is never left pinned to the captured
-        # frame for the next render job to inherit.
+                teardown.append(
+                    "The render format/codec was left on the capture's "
+                    f"({fmt}); restoring {original_fc.get('format')}/{original_fc.get('codec')} "
+                    "failed, so the next render job would inherit it."
+                )
+        # The mark range: put the user's own range back when they had one, and
+        # fall back to the whole timeline when they did not, so the range is
+        # never left pinned to the captured frame for the next render job to
+        # inherit.
         # (original_marks is already in SetRenderSettings' absolute space — see
         # the offset above.)
+        #
+        # The range goes in a payload of its own. It used to travel with
+        # CustomName "", and SetRenderSettings refuses an empty CustomName by
+        # rejecting the WHOLE payload (measured on Studio 19.1.3.7: False, and a
+        # job added afterwards still carried MarkIn == MarkOut == the captured
+        # frame). So the range was never put back, and the False was discarded.
+        # One setting per payload, each return checked.
         try:
             if original_marks:
                 restored_marks = {
@@ -15296,27 +15401,61 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
                     "MarkIn": tl.GetStartFrame(),
                     "MarkOut": tl.GetEndFrame(),
                 }
-            restored_marks["CustomName"] = ""
-            proj.SetRenderSettings(restored_marks)
-        except Exception:
-            pass
+            marks_restored = bool(proj.SetRenderSettings(restored_marks))
+            marks_exc = None
+        except Exception as exc:
+            marks_restored, marks_exc = False, exc
+        if not marks_restored:
+            logger.warning(
+                "frame capture could not restore the render range: %s",
+                marks_exc or "SetRenderSettings returned False",
+            )
+            if range_pinned:
+                teardown.append(
+                    f"The render range was left pinned to the captured frame ({frame}); "
+                    "restoring it failed, so the next render job would render one "
+                    "frame. Set the range again before rendering."
+                )
+        # The output folder, when there was one to read. Without this the
+        # user's next render job inherits a temporary folder that the cleanup
+        # just below removes.
+        if range_pinned and original_target:
+            try:
+                target_restored = bool(proj.SetRenderSettings({"TargetDir": original_target}))
+                target_exc = None
+            except Exception as exc:
+                target_restored, target_exc = False, exc
+            if not target_restored:
+                logger.warning(
+                    "frame capture could not restore the render output folder to %s: %s",
+                    original_target, target_exc or "SetRenderSettings returned False",
+                )
+                teardown.append(
+                    "The render output folder was left on the capture's temporary "
+                    f"folder; restoring {original_target!r} failed. Set it again with "
+                    "render(action='set_settings', params={'settings': {'TargetDir': ...}})."
+                )
+        _discard_still_staging(folder)
         try:
-            for f in os.listdir(folder):
-                if f.startswith(name):
-                    try:
-                        os.remove(os.path.join(folder, f))
-                    except OSError:
-                        pass
-            if not os.listdir(folder):
-                os.rmdir(folder)
+            os.rmdir(base)  # only ever succeeds when nothing else is using it
         except OSError:
             pass
-        _restore_playhead(tl, original_tc, what="the render capture")
+        if not _restore_playhead(tl, original_tc, what="the render capture"):
+            teardown.append(
+                f"The playhead was not put back at {original_tc}. Restore it with "
+                "timeline_markers(action='set_current_timecode')."
+            )
+        # Last, and checked: the render calls pull Resolve onto Deliver. The
+        # switch back is read back, and reported when it does not take.
         if original_page and original_page != "deliver":
-            try:
-                _open_page_serialized(resolve, original_page)
-            except Exception:
-                pass
+            page = _restore_page(resolve, original_page, what="the render capture")
+            if not page["restored"]:
+                teardown.append(
+                    f"Resolve is not back on the {original_page!r} page (it reads "
+                    f"{page['page']!r}): the switch failed after {page['attempts']} "
+                    f"attempt(s) ({page['error']}). Restore it with "
+                    f"resolve_control(action='open_page', params={{'page': {original_page!r}}})."
+                )
 
 
 def _playhead_frame_full(proj, tl, p: Dict[str, Any]):
@@ -15488,19 +15627,22 @@ def _playhead_frame_capture(p: Dict[str, Any]):
                 f"Failed to make {wanted!r} the current timeline",
                 code="SET_TIMELINE_FAILED", category="api_error",
             )
+    # One sentence per restore that did not take. A capture is promised to be a
+    # read, so a restore that failed is part of the answer, not just of the log.
+    teardown: List[str] = []
     try:
         if quality == "thumbnail":
-            return _playhead_frame_preview(tl, p)
-        if quality == "still":
-            return _playhead_frame_full(proj, tl, p)
-        return _playhead_frame_render(proj, tl, p)
+            result = _playhead_frame_preview(tl, p)
+        elif quality == "still":
+            result = _playhead_frame_full(proj, tl, p)
+        else:
+            result = _playhead_frame_render(proj, tl, p, teardown)
     finally:
         if original_tl is not None:
             # Best-effort by necessity: this runs in a finally, so raising or
             # returning here would replace the caller's real result (or its real
-            # exception) with a restore failure. It is still not silent -- a
-            # failed restore leaves the editor on a different timeline, which is
-            # visible immediately, and it is logged.
+            # exception) with a restore failure. It is logged, and reported
+            # alongside the result below.
             restore_err = _set_current_timeline_checked(
                 proj, original_tl, what="restoring the timeline after the capture")
             if restore_err:
@@ -15508,10 +15650,35 @@ def _playhead_frame_capture(p: Dict[str, Any]):
                     "frame capture could not restore the current timeline: %s",
                     restore_err["error"]["message"],
                 )
+                teardown.append(
+                    "The current timeline was not switched back after the capture: "
+                    f"{restore_err['error']['message']}"
+                )
+    return _capture_with_teardown(result, teardown)
 
 
-def _restore_playhead(tl, timecode, *, what: str) -> None:
+def _capture_with_teardown(result, teardown: List[str]):
+    """Attach failed restores to a capture result without replacing the capture.
+
+    An image comes back as [image, {"warnings": [...]}] -- MCP content is a list
+    of blocks anyway, so the frame is still the first block and the warnings
+    follow as text. An error envelope gains a "warnings" key. With nothing to
+    report the result is returned untouched, so a clean capture is exactly what
+    it was before: one image.
+    """
+    if not teardown:
+        return result
+    if isinstance(result, dict):
+        result["warnings"] = list(result.get("warnings") or []) + list(teardown)
+        return result
+    return [result, {"warnings": list(teardown)}]
+
+
+def _restore_playhead(tl, timecode, *, what: str) -> bool:
     """Put the playhead back after a capture. Logged, never raised.
+
+    Returns False when the restore did not take, True otherwise (including when
+    there was no timecode to restore).
 
     Deliberately fire-and-forget on the CALLER's behalf: every use of this runs
     in a `finally`, so raising or returning an error would replace the caller's
@@ -15521,16 +15688,30 @@ def _restore_playhead(tl, timecode, *, what: str) -> None:
     diagnosis and an afternoon.
     """
     if not timecode:
-        return
+        return True
     try:
         moved = tl.SetCurrentTimecode(timecode)
     except Exception as exc:
         logger.warning("could not restore the playhead to %s after %s: %s",
                        timecode, what, exc)
-        return
+        return False
     if not moved:
         logger.warning("could not restore the playhead to %s after %s: "
                        "SetCurrentTimecode returned %r", timecode, what, moved)
+        return False
+    # The return is not the evidence. A True that did not move the playhead has
+    # been observed on Studio 19.1.3.7 (straight after leaving the Deliver
+    # page), so read it back wherever it can be read.
+    try:
+        landed = tl.GetCurrentTimecode()
+    except Exception:
+        return True
+    if isinstance(landed, str) and landed and landed != timecode:
+        logger.warning("could not restore the playhead to %s after %s: "
+                       "SetCurrentTimecode returned True but the playhead reads %s",
+                       timecode, what, landed)
+        return False
+    return True
 
 
 def _set_current_timeline_checked(proj, tl, *, what: str):
@@ -18158,11 +18339,13 @@ def _resolve_restore_state(p: Dict[str, Any]) -> Dict[str, Any]:
 
     # Restore page first so subsequent ops land in the right context
     if state.get("page"):
-        try:
-            r.OpenPage(state["page"])
+        # Reported from a readback, not from having asked: OpenPage's return
+        # used to be discarded and the page listed as restored regardless.
+        page = _restore_page(r, state["page"], what="restore_state")
+        if page["restored"]:
             restored["page"] = state["page"]
-        except Exception as exc:
-            restored["page_error"] = str(exc)
+        else:
+            restored["page_error"] = page["error"]
 
     pm = r.GetProjectManager()
     proj = pm.GetCurrentProject() if pm else None
@@ -21089,7 +21272,10 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
             )
         return {"success": True, "format_id": _format_id, "codec_id": _codec_id}
     elif action == "get_mode":
-        return {"mode": proj.GetCurrentRenderMode()}
+        # The getter itself switches Resolve to the Deliver page (api_truth
+        # 'Project.GetCurrentRenderMode'); a read must not move the user.
+        with _restoring_page(get_resolve(), what="a render-mode read"):
+            return {"mode": proj.GetCurrentRenderMode()}
     elif action == "set_mode":
         return {"success": bool(proj.SetCurrentRenderMode(p["mode"]))}
     elif action == "get_resolutions":
@@ -21148,7 +21334,9 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
     elif action == "probe_render_matrix":
         return _probe_render_matrix(proj, p)
     elif action == "probe_render_settings":
-        return _render_settings_snapshot(proj)
+        # Reads the render mode, which switches to Deliver; see get_mode.
+        with _restoring_page(get_resolve(), what="a render-settings read"):
+            return _render_settings_snapshot(proj)
     elif action == "validate_render_settings":
         return _validate_render_settings_action(p)
     elif action == "safe_set_render_settings":
@@ -26634,6 +26822,7 @@ def timeline_frame(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
 
     Actions:
       capture(timecode?|frame?, quality?, max_width?, format?, timeline_name?) -> MCP image content
+        (followed by a {"warnings": [...]} block only when a restore failed; see below)
       capabilities() -> {quality_modes, ffmpeg, render_settings_restorable, ...}
 
     capture parameters:
@@ -26655,11 +26844,13 @@ def timeline_frame(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
     Choosing a quality — the trade-off is accuracy against side effects:
 
       'frame'/'preview'  Frame-exact. Renders one frame, so it changes
-                   project-level render settings. Format and codec are restored;
-                   TargetDir, CustomName and the mark range cannot be read back
-                   on builds without GetRenderSettings, so they are reset to the
-                   full timeline rather than truly restored. Refuses while
-                   another render is running.
+                   project-level render settings, and puts them back: render
+                   mode, format, codec, mark range and output folder
+                   (TargetDir). The file name (CustomName) is never touched.
+                   One exception: a project that has never had an output
+                   folder has none to put back, and Resolve cannot clear one,
+                   so it is left on the capture's temporary folder. Refuses
+                   while another render is running.
       'thumbnail'  Changes nothing and returns instantly, but it is NOT frame
                    accurate: GetCurrentClipThumbnailImage returns the clip's
                    thumbnail, identical for every frame of that clip (measured
@@ -26670,8 +26861,13 @@ def timeline_frame(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
                    be open on the Color page — no scripting call can open it,
                    so this fails with a bare refusal when it is closed.
 
-    The playhead, the Color page, the current timeline and the Gallery are all
-    restored; a capture is a read of the picture, not an edit of the cut.
+    The playhead, the page you were on, the current timeline and the Gallery
+    are all restored; a capture is a read of the picture, not an edit of the
+    cut. The render calls pull Resolve onto the Deliver page, so the render
+    route switches back and reads the page to confirm it. If any restore does
+    not take, the image is followed by {"warnings": [...]} naming what was left
+    changed and the call that puts it back (an error result carries the same
+    "warnings" key). No warnings block means every restore was confirmed.
     """
     p = _params(params)
     if action == "capture":
@@ -26690,6 +26886,21 @@ def timeline_frame(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
             "ffmpeg": bool(shutil.which("ffmpeg")),
             "max_width_supported": bool(shutil.which("ffmpeg")),
             "current_page": current_page,
+            # What the render route ('frame'/'preview') leaves as it found it.
+            # TargetDir is read off a throwaway render job and written back;
+            # CustomName is never written. The one gap is a project with no
+            # TargetDir yet: there is none to read and Resolve cannot clear it.
+            "render_settings_restorable": {
+                "render_mode": True,
+                "format_codec": True,
+                "mark_range": True,
+                "TargetDir": True,
+                "CustomName": True,
+            },
+            "render_settings_caveat": (
+                "A project that has never had a render TargetDir is left with the "
+                "capture's temporary folder as its TargetDir."
+            ),
         }
         _, tl, err = _get_tl()
         if err:
@@ -33216,14 +33427,16 @@ def _install_threaded_tool_dispatch(fastmcp) -> int:
     to a worker thread keeps the event loop servicing the transport. Bodies are
     serialized on _bridge_lock so the single-threaded Resolve bridge is never
     entered concurrently. A body that outlives a client cancellation runs to
-    completion (the bridge is never left half-mutated) still holding the lock.
+    completion (the bridge is never left half-mutated) still holding the lock,
+    and its result is then discarded rather than sent.
 
     Couples to mcp SDK private attrs (ToolManager._tools, Tool.fn /
-    Tool.is_async; verified on mcp 1.27). Best-effort: if that shape changes,
-    leave the tools as-is, falling back to the current inline behavior.
+    Tool.is_async; verified on mcp 1.27 and 1.30). Best-effort: if that shape
+    changes, leave the tools as-is, falling back to the current inline behavior.
     """
     import functools
     import anyio
+    from anyio.lowlevel import checkpoint_if_cancelled
 
     manager = getattr(fastmcp, "_tool_manager", None)
     tools = getattr(manager, "_tools", None)
@@ -33236,7 +33449,18 @@ def _install_threaded_tool_dispatch(fastmcp) -> int:
             def call():
                 with _bridge_lock:
                     return fn(**kwargs)
-            return await anyio.to_thread.run_sync(call)
+            try:
+                return await anyio.to_thread.run_sync(call)
+            finally:
+                # run_sync shields its wait, so a client cancellation that lands
+                # while the body runs is not raised there: the result comes back
+                # as if nothing happened, the SDK tries to answer a request it
+                # already answered "cancelled", and its "Request already
+                # responded to" assert takes the whole session down (#272).
+                # Raise the pending cancellation instead — the SDK expects it
+                # and suppresses the duplicate response. Also covers a body
+                # that raised after the cancel.
+                await checkpoint_if_cancelled()
         return run_off_thread
 
     wrapped = 0

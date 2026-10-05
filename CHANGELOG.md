@@ -2,6 +2,263 @@
 
 Release history for the DaVinci Resolve MCP Server. The latest release is summarized in the root README; older entries live here to keep the README focused.
 
+## What's New in v4.8.28 — ffmpeg can no longer hang on the protocol stream; a cancelled call no longer kills the server
+
+### Fixed
+
+- **ffmpeg could hang indefinitely while reading the server's stdin.** Every
+  ffmpeg/ffprobe analysis pass (`edit_engine plan_silence_ripple`, media
+  analysis, sync detection, sound density and the rest) ran through a
+  runner that let the child inherit the server's stdin. Over stdio that is
+  the JSON-RPC stream. ffmpeg polls stdin for keyboard commands; the `c` in
+  `"jsonrpc"` opens its interactive command prompt, which then waits for a
+  newline while consuming the protocol bytes it reads. Measured with ffmpeg
+  9.0.2: a partial frame arriving mid-pass hung a silencedetect run until it
+  was killed, and the same run with `stdin=subprocess.DEVNULL` finished
+  normally. The runner, and all 29 other call sites under `src/` that spawned
+  a child without `stdin=`, now pass `stdin=subprocess.DEVNULL`. Reported on
+  Windows with the free 21.0.2 bridge (#272); the mechanism was reproduced on
+  macOS, and the Windows build was not available to test.
+- **A tool call cancelled by the client could take the whole session down.**
+  Tool bodies run in a worker thread, and the wait for that thread is
+  shielded from cancellation. When the client cancelled (for example after
+  its own timeout) and the body finished later, its result came back as if
+  nothing had happened. The SDK then tried to answer a request it had already
+  answered "cancelled", and its `Request already responded to` assertion
+  closed the connection. The pending cancellation is now raised once the
+  body returns, which the SDK treats as the cancellation it already
+  acknowledged. The body still runs to completion, so Resolve is never left
+  half-mutated; only its result is discarded.
+
+### Tests
+
+- `tests/test_subprocess_stdin_discipline.py` (new) fails the suite on any
+  `subprocess.run/Popen/call/check_call/check_output` under `src/` that does
+  not pass `stdin=` or `input=`, in any import spelling. With the fix
+  reverted it names all 30 sites (the runner plus the 29 others).
+- `tests/test_threaded_tool_dispatch.py` gains an end-to-end case over the
+  real SDK's in-memory transport: it cancels a call mid-body, lets the body
+  finish, and requires the next call to succeed. With the fix reverted, it
+  fails with the reported `AssertionError`.
+
+### Validation
+
+- No Resolve scripting call changed. Both mechanisms were reproduced before
+  the fix and confirmed fixed after it, on macOS with ffmpeg 9.0.2 and
+  mcp 1.30.0. Not tested on Windows.
+
+## What's New in v4.8.27 — Linux exports no longer redirected away from /tmp-named folders
+
+### Fixed
+
+- **On Linux, an output folder whose name merely began with `/tmp` or
+  `/var/tmp` was silently replaced.** `_resolve_safe_dir` tested
+  `path.startswith("/tmp")`, which is also true of `/tmpdata`, `/tmpfiles`,
+  `/tmp-scratch` and `/var/tmpdata`. Each was treated as a temp directory and
+  swapped for `~/Documents/resolve-stills`, and
+  `gallery_stills(grab_and_export)` then reported that folder as if it were the
+  one asked for. The same helper picks the output folder for `encrypt_dctl` and
+  the granular `save_project` export fallback. The Linux branch now compares by
+  path segment, as the macOS branch already did; `/tmp`, `/tmp/…`, `/var/tmp`
+  and `/var/tmp/…` still redirect. Both copies of the helper (`src/server.py`
+  and `src/granular/common.py`) are fixed. Thanks to @Dev-next-gen (#271).
+
+### Tests
+
+- `tests/test_granular_safe_dir.py` gains a Linux class covering both copies:
+  real temp paths still redirect, sibling names are left alone.
+
+### Validation
+
+- Path classification only, decided before any Resolve call; no Resolve
+  behavior changed. Live test not required.
+
+## What's New in v4.8.26 — two dead layout-preset helpers removed
+
+### Removed
+
+- `src/utils/layout_presets.py` no longer carries `save_layout_preset` and
+  `load_layout_preset`. Both went through `Resolve.GetUIManager()` and then
+  `SaveUILayout` / `LoadUILayout`, none of which exist on any build measured
+  (Studio 19.1.3.7; see the `api_truth` entry added in v4.8.25). Nothing called
+  them: the granular `save_layout_preset_tool` and `load_layout_preset_tool`
+  use `Resolve.SaveLayoutPreset` / `LoadLayoutPreset` directly, and still do.
+  No tool, action or count changes. The module docstring now says what the
+  file actually does (preset files on disk) and where live save/load happens.
+- `scripts/audit_api_parity.py` drops `LoadUILayout` and `SaveUILayout` from
+  its allowlist, since no source calls them any more.
+
+### Validation
+
+- No Resolve behavior changed; the removed functions had no callers. Live test
+  not required.
+
+## What's New in v4.8.25 — open_settings and open_app_preferences say what Resolve cannot do
+
+### Fixed
+
+- **The granular `open_settings` and `open_app_preferences` tools could never
+  work, and reported that as an ordinary failure.** Both went through
+  `Resolve.GetUIManager()`, which does not exist. Measured on Studio 19.1.3.7:
+  `dir(resolve)` lists 23 methods and `GetUIManager` is not one of them;
+  `Fusion().UIManager` is real but has neither `OpenProjectSettings` nor
+  `OpenPreferences`; and none of the three names appears in the 21.1 typed API.
+  The call raised `'NoneType' object is not callable`, a broad `except`
+  swallowed it, an ERROR was logged, and the tool answered
+  `Failed to open Project Settings dialog` with no reason.
+  Both tools now answer `Not supported:` and name the call that is missing;
+  `open_settings` also names the tools that read and write project settings.
+  Nothing is logged as an error, because nothing went wrong.
+- The route is now probed with `has_method` rather than `hasattr`, which is
+  true for every name on a Resolve object. If a future build does provide these
+  calls they are used, and their result is reported: the old code discarded the
+  return and answered success regardless, so a refusal would have read as a
+  dialog that opened.
+
+### Documentation
+
+- `api_truth` records the absence, with what `Fusion().UIManager` does expose.
+  Whether `UIManager.DoAction` or `QueueAction` can open these dialogs was not
+  tried: both dialogs are modal, and a modal dialog blocks the scripting API
+  until a person closes it.
+- `scripts/audit_api_parity.py` no longer describes `GetUIManager` as a
+  documented API.
+
+### Tests
+
+- `tests/test_app_control_dialogs.py`: a fake that fabricates attributes the way
+  a Resolve object does (every `hasattr` true, a missing `getattr` is `None`).
+  Covers the measured build, a manager without the method, a build that has
+  the call, a refusal, an exception, and both granular tools. Eight of its
+  twelve tests fail against v4.8.24.
+- `tests/test_discarded_resolve_returns.py` now covers every `Open*` call, not
+  only `OpenPage`.
+
+## What's New in v4.8.24 — a frame capture leaves the render output folder and file name alone
+
+### Fixed
+
+- **`timeline_frame` capture left the project's render output folder and file
+  name on its own temporary values.** The render route (`quality="frame"`,
+  `"preview"`, `"full"`) wrote `TargetDir` and `CustomName` and put neither
+  back, because there is no `GetRenderSettings` to read them from. The user's
+  next render job inherited a temporary folder the capture had already deleted
+  and a name like `capture-<timestamp>`. v4.8.23 documented this; this release
+  fixes it.
+  - **Output folder (`TargetDir`).** A queued render job carries the settings it
+    inherited, so the capture queues a throwaway job, reads `TargetDir` off its
+    `GetRenderJobList` entry, deletes the job, and writes the folder back
+    afterwards. A folder that is not put back, or a throwaway job that cannot
+    be removed, is reported in the capture's `warnings` block.
+  - **File name (`CustomName`).** It is no longer written at all. It can be
+    neither read back nor cleared (an empty one is refused), so the capture
+    renders under whatever name the project already produces, into a private
+    folder of its own, and takes the one file that appears there.
+  - Live on Studio 19.1.3.7, with a `.mov` format, an output folder and a custom
+    name set: a job queued after each of 15 captures inherited the same folder,
+    file name, range and format as one queued before, and the render queue was
+    left empty.
+- **One gap remains, and it is stated rather than hidden.** A project that has
+  never had an output folder has none to read (`AddRenderJob` returns `''`),
+  and Resolve cannot clear one once set, so such a project is left with the
+  capture's temporary folder as its `TargetDir`. `timeline_frame capabilities`
+  reports this as `render_settings_caveat`.
+- The captured frame can no longer be confused with, or delete, another file in
+  the shared capture folder. Each capture renders into its own subfolder; the
+  shared one (`~/Documents/resolve-stills` on macOS) is only removed when empty.
+
+### Changed
+
+- `timeline_frame capabilities`: `render_settings_restorable.TargetDir` and
+  `.CustomName` are now `true`, and `render_settings_caveat` is new.
+- A render capture takes about 0.2 s longer (measured: roughly 1.3 s against
+  1.1 s), which is the throwaway job used to read the output folder.
+
+### Documentation
+
+- `api_truth` gains `Project.AddRenderJob (the only readback for render
+  settings)`, measured on Studio 19.1.3.7: what a job entry exposes, that
+  `TargetDir` cannot be cleared, when `AddRenderJob` returns `''`, and that
+  duplicate jobs and existing output files raise no dialog.
+  `docs/reference/api-limitations.md` is regenerated.
+
+### Tests
+
+- `tests/test_playhead_frame_capture.py`: the render fake now models the job
+  queue as the readback it is. `CaptureOutputSettingsTest` covers the folder
+  coming back, the name never being written, a project with no output folder, a
+  same-named file already in the shared folder, the read happening in
+  single-clip mode before anything changes, and both failure reports. Six of
+  its ten tests fail against v4.8.23.
+- `tests/live_frame_capture_page_restore_validation.py` now gives the disposable
+  project a user's render settings and compares what a job inherits before and
+  after every capture, including one from Individual-clips mode.
+
+## What's New in v4.8.23 — a frame capture no longer leaves Resolve on the Deliver page
+
+### Fixed
+
+- **`timeline_frame` capture left Resolve on the Deliver page.** ([#270](https://github.com/samuelgursky/davinci-resolve-mcp/issues/270), reported by @Dragonfist76 on Studio 21.1.0.17)
+  The render route (`quality="frame"`, `"preview"`, `"full"`) recorded the page
+  to return to *after* calling `Project.GetCurrentRenderMode()`. That getter
+  switches Resolve to the Deliver page by itself (measured on Studio 19.1.3.7
+  from Edit, Color and Fairlight), so the page recorded was always `deliver` and
+  the restore was skipped as having nothing to do. The page is now read before
+  any render call. Live on 19.1.3.7: 14 captures from seven starting pages all
+  ended on the page they started on.
+- **A restore that does not take is no longer silent.** The switch back is read
+  back with `GetCurrentPage()`. If the page, playhead, current timeline, render
+  mode, render format or render range is not put back, the image is followed by
+  a `{"warnings": [...]}` block naming what was left changed and the call that
+  restores it; an error result carries the same `warnings` key. A clean capture
+  is unchanged: one image.
+- **The render range was never restored after a capture.** The restore shared a
+  `SetRenderSettings` payload with `CustomName: ""`, and Resolve refuses an empty
+  `CustomName` by rejecting the whole payload (measured on 19.1.3.7: `False`, and
+  a job queued afterwards still carried `MarkIn == MarkOut ==` the captured
+  frame). The range now goes in its own payload and its result is checked. Live
+  on 19.1.3.7: a job queued after each capture carried the whole timeline.
+- **`render get_mode`, `render probe_render_settings` and the granular
+  `get_current_render_mode` left Resolve on the Deliver page**, for the same
+  reason: they call the same getter. They now return to the page they were
+  called from.
+- **`resolve_control restore_state` reported the page as restored without
+  checking.** `OpenPage`'s return was discarded. `restored.page` is now written
+  only when the page reads back, and `page_error` says why otherwise.
+- The Color-page and Edit-page guards used by thumbnails and timeline edits
+  discarded `OpenPage` on their way back too. Both now read the page back and
+  log a failure.
+
+### Changed
+
+- `timeline_frame capabilities` returns `render_settings_restorable`, which its
+  docstring already listed. `TargetDir` and `CustomName` are `false`: there is no
+  `GetRenderSettings`, so after a render capture they stay on the capture's
+  temporary folder and name. The docs previously said they were reset.
+
+### Documentation
+
+- `api_truth` gains two measured entries, both on Studio 19.1.3.7:
+  `Project.GetCurrentRenderMode` switches to the Deliver page (with the list of
+  render calls that do and do not), and `Project.SetRenderSettings` rejects a
+  whole payload over an empty `CustomName`. `docs/reference/api-limitations.md`
+  is regenerated.
+
+### Tests
+
+- `tests/test_playhead_frame_capture.py`: the render fake now behaves as
+  measured (the mode getter switches page; an empty `CustomName` refuses the
+  payload). New tests cover the page coming back, a refused or lying `OpenPage`
+  being reported with the image, the warning reaching an MCP client as a text
+  block after the image, and the range Resolve holds after a capture. The two
+  regression tests fail against v4.8.22.
+- `tests/test_page_restore.py`: `restore_page`, `restoring_page`, both page
+  guards, the three render-mode readers and `restore_state`.
+- `tests/test_discarded_resolve_returns.py` now treats `OpenPage` and the
+  `open_page_serialized` wrapper as mutators whose return must be used.
+- `tests/live_frame_capture_page_restore_validation.py`: the live harness behind
+  the numbers above.
+
 ## What's New in v4.8.22 — the control panel port check cannot hang on a wedged lsof
 
 ### Fixed
